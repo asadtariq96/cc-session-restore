@@ -1,0 +1,4 @@
+*.log
+*.tsv
+.DS_Store
+.snap.*

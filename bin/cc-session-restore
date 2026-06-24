@@ -1,0 +1,227 @@
+#!/usr/bin/env bash
+# cc-session-restore — snapshot & restore open Claude Code (iTerm2) sessions across reboots.
+#
+# A reboot kills the `claude` processes but not the conversations (Claude journals each
+# session to <config>/projects/...). This tool records which sessions are open and reopens
+# them afterwards with `claude --resume <id>`.
+#
+# Source of truth: <config>/sessions/<PID>.json, which Claude Code maintains for every
+# running session ({"pid","sessionId","cwd","name","status",...}). This is exact for bare
+# `claude`, `--resume <uuid>`, and `--resume <name>`/picker-resumed sessions alike.
+#
+# https://github.com/asadtariq96/cc-session-restore
+set -uo pipefail
+
+VERSION="0.1.0"
+LABEL="io.github.cc-session-restore"
+
+# minimal, predictable environment (matters when run under launchd)
+export LC_ALL=C
+export PATH=/usr/bin:/bin:/usr/sbin:/sbin
+
+# --- paths -------------------------------------------------------------------
+: "${CLAUDE_CONFIG_DIR:=$HOME/.claude}"
+SESSIONS_DIR="$CLAUDE_CONFIG_DIR/sessions"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/cc-session-restore"
+SNAPSHOT="$STATE_DIR/snapshot.tsv"
+PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
+
+err() { printf 'cc-session-restore: %s\n' "$*" >&2; }
+die() { err "$*"; exit 1; }
+
+require_macos() {
+  [ "$(uname -s)" = "Darwin" ] || die "macOS-only (needs launchd + iTerm2)."
+}
+
+self_path() {
+  local s="${BASH_SOURCE[0]}"
+  ( cd "$(dirname "$s")" >/dev/null 2>&1 && printf '%s/%s\n' "$(pwd -P)" "$(basename "$s")" )
+}
+
+# --- tiny JSON readers (no jq dependency) ------------------------------------
+json_str() { grep -o "\"$2\":\"[^\"]*\"" "$1" 2>/dev/null | head -1 | sed 's/.*:"//; s/"$//'; }
+json_num() { grep -o "\"$2\":[0-9]*"     "$1" 2>/dev/null | head -1 | sed 's/.*://'; }
+
+# --- snapshot ----------------------------------------------------------------
+cmd_snapshot() {
+  require_macos
+  [ -d "$SESSIONS_DIR" ] || die "Claude session dir not found: $SESSIONS_DIR
+(Is Claude Code installed and recent enough? Set CLAUDE_CONFIG_DIR if you relocated ~/.claude.)"
+  mkdir -p "$STATE_DIR"
+  local tmp; tmp="$(mktemp "$STATE_DIR/.snap.XXXXXX")"
+  local claimed=" " f pid sid cwd name comm title
+
+  for f in "$SESSIONS_DIR"/*.json; do
+    [ -e "$f" ] || continue
+    pid="$(json_num "$f" pid)"
+    sid="$(json_str "$f" sessionId)"
+    cwd="$(json_str "$f" cwd)"
+    name="$(json_str "$f" name)"
+    if [ -z "$pid" ] || [ -z "$sid" ]; then continue; fi
+    # keep only PIDs that are still a live `claude` process (reject recycled PIDs)
+    comm="$(ps -o comm= -p "$pid" 2>/dev/null)" || continue
+    case "$comm" in *claude) ;; *) continue ;; esac
+    case "$claimed" in *" $sid "*) continue ;; esac
+    claimed="$claimed$sid "
+    title="${name:-$(basename "$cwd")}"
+    printf '%s\t%s\t%s\n' "$sid" "$cwd" "$title" >> "$tmp"
+  done
+
+  local n; n="$(grep -c . "$tmp" 2>/dev/null || true)"; n="${n:-0}"
+  # don't clobber a good snapshot with an empty one (e.g. run mid-shutdown)
+  if [ "$n" -eq 0 ] && [ -s "$SNAPSHOT" ]; then
+    rm -f "$tmp"; echo "snapshot: 0 live sessions; kept existing $SNAPSHOT"; return 0
+  fi
+  mv "$tmp" "$SNAPSHOT"
+  echo "snapshot: captured $n live session(s) -> $SNAPSHOT"
+}
+
+# --- restore -----------------------------------------------------------------
+cmd_restore() {
+  require_macos
+  local dry=0
+  [ "${1:-}" = "--dry-run" ] && dry=1
+  [ -s "$SNAPSHOT" ] || die "no snapshot at $SNAPSHOT (run: cc-session-restore snapshot)"
+
+  if [ "$dry" = 1 ]; then
+    echo "restore (dry-run): $(grep -c . "$SNAPSHOT") session(s)"
+    local sid cwd title
+    while IFS=$'\t' read -r sid cwd title; do
+      [ -n "$sid" ] || continue
+      printf '  %s  (%s)\n     cd %s && claude --resume %s\n' "$title" "$sid" "$cwd" "$sid"
+    done < "$SNAPSHOT"
+    return 0
+  fi
+
+  osascript -e 'id of app "iTerm"' >/dev/null 2>&1 \
+    || die "iTerm2 not found — this version restores into iTerm2 only."
+
+  local osa first=1 sid cwd title cmd
+  osa='tell application "iTerm2"
+  activate
+  set w to (create window with default profile)
+'
+  while IFS=$'\t' read -r sid cwd title; do
+    [ -n "$sid" ] || continue
+    cmd="cd \\\"$cwd\\\" && claude --resume $sid"
+    if [ "$first" = 1 ]; then
+      osa+="  tell current session of w to write text \"$cmd\"
+"
+      first=0
+    else
+      osa+="  tell w to create tab with default profile
+  tell current session of w to write text \"$cmd\"
+"
+    fi
+  done < "$SNAPSHOT"
+  osa+='end tell'
+  printf '%s\n' "$osa" | osascript -
+  echo "restore: launched $(grep -c . "$SNAPSHOT") tab(s)."
+}
+
+# --- launch agent ------------------------------------------------------------
+agent_install() {
+  require_macos
+  local bin gui; bin="$(self_path)"; gui="gui/$(id -u)"
+  mkdir -p "$STATE_DIR" "$(dirname "$PLIST")"
+  cat > "$PLIST" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>$LABEL</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>$bin</string>
+    <string>snapshot</string>
+  </array>
+  <key>StartInterval</key><integer>60</integer>
+  <key>RunAtLoad</key><true/>
+  <key>StandardOutPath</key><string>$STATE_DIR/agent.log</string>
+  <key>StandardErrorPath</key><string>$STATE_DIR/agent.err.log</string>
+</dict>
+</plist>
+PLIST
+  launchctl bootout "$gui/$LABEL" 2>/dev/null || true
+  launchctl bootstrap "$gui" "$PLIST" || die "failed to load LaunchAgent"
+  launchctl kickstart -k "$gui/$LABEL" 2>/dev/null || true
+  echo "agent: installed and loaded ($LABEL) — snapshots every 60s."
+}
+
+agent_uninstall() {
+  launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
+  rm -f "$PLIST"
+  echo "agent: unloaded and removed."
+}
+
+cmd_agent() {
+  case "${1:-}" in
+    install)   agent_install ;;
+    uninstall) agent_uninstall ;;
+    status)    cmd_status ;;
+    *) die "usage: cc-session-restore agent {install|uninstall|status}" ;;
+  esac
+}
+
+# --- status ------------------------------------------------------------------
+cmd_status() {
+  echo "cc-session-restore $VERSION"
+  local found="(MISSING)"; [ -d "$SESSIONS_DIR" ] && found="(found)"
+  printf 'claude sessions: %s %s\n' "$SESSIONS_DIR" "$found"
+  echo "state dir:       $STATE_DIR"
+  if [ -s "$SNAPSHOT" ]; then
+    printf 'last snapshot:   %s — %s session(s)\n' "$(stat -f '%Sm' -t '%Y-%m-%d %H:%M' "$SNAPSHOT")" "$(grep -c . "$SNAPSHOT")"
+  else
+    echo "last snapshot:   (none)"
+  fi
+  if launchctl print "gui/$(id -u)/$LABEL" >/dev/null 2>&1; then
+    echo "launch agent:    loaded ($LABEL)"
+  else
+    echo "launch agent:    not loaded"
+  fi
+}
+
+# --- uninstall (everything) --------------------------------------------------
+cmd_uninstall() {
+  require_macos
+  agent_uninstall
+  rm -rf "$STATE_DIR"
+  echo "removed state at $STATE_DIR"
+  echo "to finish, delete the binary:  rm -f \"$(self_path)\""
+}
+
+usage() {
+  cat <<EOF
+cc-session-restore $VERSION — resume Claude Code (iTerm2) sessions across reboots.
+
+USAGE:
+  cc-session-restore <command>
+
+COMMANDS:
+  snapshot              Record currently-open Claude sessions to the snapshot file
+  restore [--dry-run]   Reopen one iTerm2 window with a tab per snapshotted session
+  status                Show config / snapshot / agent status
+  agent install         Install + load the 60s auto-snapshot LaunchAgent
+  agent uninstall       Unload + remove the LaunchAgent
+  uninstall             Remove the agent and state (prints how to delete the binary)
+  --version             Print version
+  --help                Show this help
+
+Once the agent is installed, snapshots run automatically every 60s.
+After a reboot, run:  cc-session-restore restore
+EOF
+}
+
+main() {
+  case "${1:-}" in
+    snapshot)             shift; cmd_snapshot "$@" ;;
+    restore)              shift; cmd_restore "$@" ;;
+    status)               shift; cmd_status "$@" ;;
+    agent)                shift; cmd_agent "$@" ;;
+    uninstall)            shift; cmd_uninstall "$@" ;;
+    -v|--version|version) echo "cc-session-restore $VERSION" ;;
+    ""|-h|--help|help)    usage ;;
+    *) err "unknown command: $1"; usage; exit 1 ;;
+  esac
+}
+main "$@"
