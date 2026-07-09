@@ -12,7 +12,7 @@
 # https://github.com/asadtariq96/cc-session-restore
 set -uo pipefail
 
-VERSION="0.1.0"
+VERSION="0.2.0"
 LABEL="io.github.cc-session-restore"
 
 # minimal, predictable environment (matters when run under launchd)
@@ -444,6 +444,12 @@ cmd_status() {
   else
     echo "last snapshot:   (none)"
   fi
+  local hc; hc="$(history_files | grep -c . )"
+  printf 'history:         %s snapshot(s)\n' "$hc"
+  local def; def="$(select_default)"
+  if [ -n "$def" ]; then
+    printf 'restore target:  %s (%s session(s))\n' "$(basename "$def" .tsv)" "$(grep -c . "$def")"
+  fi
   if launchctl print "gui/$(id -u)/$LABEL" >/dev/null 2>&1; then
     echo "launch agent:    loaded ($LABEL)"
   else
@@ -469,7 +475,14 @@ USAGE:
 
 COMMANDS:
   snapshot              Record currently-open Claude sessions to the snapshot file
-  restore [--dry-run]   Reopen one iTerm2 window with a tab per snapshotted session
+  restore [opts]        Reopen sessions. With no opts: interactive picker (or the
+                        reboot-aware default when non-interactive). Options:
+                          --list             list snapshot history (no launch)
+                          --show <id>        print the sessions in one snapshot
+                          --snapshot <id>    restore a specific snapshot
+                          --latest           restore the newest snapshot
+                          -y, --yes          skip the picker; use the default
+                          --dry-run          show what would reopen
   status                Show config / snapshot / agent status
   agent install         Install + load the 60s auto-snapshot LaunchAgent
   agent uninstall       Unload + remove the LaunchAgent
