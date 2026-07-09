@@ -24,10 +24,10 @@ out="$(run restore --latest --dry-run </dev/null)"
 assert_contains "$out" "claude --resume n1" "--latest = newest overall"
 
 # --snapshot by index 2 -> older set.
-out="$(run restore --snapshot 2 --dry-run </dev/null)"
+out="$(run restore --snapshot 2 --dry-run </dev/null)"; rc=$?
 assert_contains "$out" "claude --resume s1" "--snapshot 2 = older set"
 
 # dry-run must not require macOS (would have died otherwise on Linux).
-assert_eq "0" "$?" "dry-run exits 0 on non-macOS"
+assert_eq "0" "$rc" "dry-run exits 0 on non-macOS"
 
 finish
