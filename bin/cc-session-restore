@@ -142,6 +142,61 @@ list_history() {
   echo "* = default target for 'restore'"
 }
 
+# Lines for fzf: "<id>\t<display>"; --with-nth hides the id column.
+_pick_lines() {
+  local total idx f base boot ts count cur human marker
+  cur="$(current_boot)"
+  total="$(history_files | grep -c . )"
+  idx=0
+  while [ "$idx" -lt "$total" ]; do
+    f="$(history_files | sed -n "$((total - idx))p")"   # newest-first
+    base="$(basename "$f" .tsv)"; boot="${base%%-*}"; ts="${base#*-}"
+    count="$(grep -c . "$f")"
+    if [ "$boot" = "$cur" ]; then marker="this-boot "; else marker="prior-boot"; fi
+    human="$(printf '%s' "$ts" | _human_ts)"
+    printf '%s\t%s  %s  %s sessions\n' "$base" "$human" "$marker" "$count"
+    idx=$((idx + 1))
+  done
+}
+
+_pick_menu() {
+  local total ans idx f defidx=1
+  total="$(history_files | grep -c . )"
+  [ "$total" -gt 0 ] || return 1
+  list_history >&2
+  local def; def="$(select_default)"
+  idx=0
+  while [ "$idx" -lt "$total" ]; do
+    f="$(history_files | sed -n "$((total - idx))p")"
+    [ "$f" = "$def" ] && defidx=$((idx + 1))
+    idx=$((idx + 1))
+  done
+  printf 'Restore which? [%s]: ' "$defidx" >&2
+  IFS= read -r ans || true
+  [ -n "$ans" ] || ans="$defidx"
+  resolve_id "$ans" || return 1
+}
+
+_pick_fzf() {
+  local self line id
+  self="$(self_path)"
+  line="$(_pick_lines | fzf --ansi --delimiter=$'\t' --with-nth=2.. \
+          --height=40% --reverse --no-multi \
+          --preview "$self restore --show {1}" --preview-window=right,50%)" || return 1
+  [ -n "$line" ] || return 1
+  id="${line%%$'\t'*}"
+  resolve_id "$id"
+}
+
+pick_interactive() {
+  [ "$(history_files | grep -c . )" -gt 0 ] || { select_default; return 0; }
+  if command -v fzf >/dev/null 2>&1; then
+    _pick_fzf
+  else
+    _pick_menu
+  fi
+}
+
 show_snapshot() { # $1 = id
   local f sid cwd title
   f="$(resolve_id "$1")" || die "no snapshot matching '$1' (see: cc-session-restore restore --list)"
@@ -315,7 +370,6 @@ cmd_restore() {
     show) show_snapshot "$id"; return 0 ;;
   esac
 
-  : "$yes"  # reserved for the confirmation prompt added in Task 9
   local file=""
   case "$mode" in
     latest)
@@ -324,7 +378,11 @@ cmd_restore() {
       file="$(resolve_id "$id")" \
         || die "no snapshot matching '$id' (see: cc-session-restore restore --list)" ;;
     default)
-      file="$(select_default)"
+      if [ "$yes" = 0 ] && [ -t 0 ] && [ -t 1 ]; then
+        file="$(pick_interactive)" || return 0     # cancelled = no launch
+      else
+        file="$(select_default)"
+      fi
       [ -n "$file" ] || file="$SNAPSHOT" ;;
   esac
   [ -n "$file" ] && [ -s "$file" ] || die "nothing to restore"
