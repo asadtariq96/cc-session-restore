@@ -92,6 +92,26 @@ select_default() {
   fi
 }
 
+# Append CANDIDATE to history unless it duplicates the newest same-boot entry.
+# Always refresh snapshot.tsv from a non-empty candidate. Empty = no-op.
+append_snapshot() { # $1 = candidate tsv (may be empty/zero-length)
+  local cand="$1" cur newest ts dest do_append=1
+  [ -s "$cand" ] || return 0
+  cur="$(current_boot)"
+  newest="$(newest_history)"
+  if [ -n "$newest" ] && cmp -s "$cand" "$newest" \
+     && [ "$(boot_of_file "$newest")" = "$cur" ]; then
+    do_append=0
+  fi
+  if [ "$do_append" = 1 ]; then
+    ts="$(now_ts)"
+    dest="$STATE_DIR/history/$cur-$ts.tsv"
+    mkdir -p "$STATE_DIR/history"
+    cp "$cand" "$dest"
+  fi
+  cp "$cand" "$SNAPSHOT"
+}
+
 # --- snapshot ----------------------------------------------------------------
 cmd_snapshot() {
   require_macos
