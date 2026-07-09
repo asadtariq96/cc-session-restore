@@ -55,6 +55,23 @@ current_boot() {
 
 now_ts() { printf '%s\n' "${CCSR_NOW_OVERRIDE:-$(date -u +%Y%m%dT%H%M%S)}"; }
 
+# --- history helpers ---------------------------------------------------------
+history_files() {
+  local f
+  for f in "$STATE_DIR"/history/*.tsv; do
+    [ -e "$f" ] || continue
+    printf '%s\n' "$f"
+  done | sort
+}
+
+newest_history() { history_files | tail -n 1; }
+
+boot_of_file() { # path -> boot prefix
+  local b
+  b="$(basename "$1")"
+  printf '%s\n' "${b%%-*}"
+}
+
 # --- snapshot ----------------------------------------------------------------
 cmd_snapshot() {
   require_macos
