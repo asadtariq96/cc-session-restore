@@ -255,6 +255,43 @@ cmd_snapshot() {
 }
 
 # --- restore -----------------------------------------------------------------
+launch_file() { # $1 = tsv file, $2 = dry (0/1)
+  local file="$1" dry="$2" n sid cwd title cmd osa first=1 stem
+  stem="$(basename "$file" .tsv)"
+  n="$(grep -c . "$file")"
+  if [ "$dry" = 1 ]; then
+    echo "restore (dry-run): $n session(s) from $stem"
+    while IFS=$'\t' read -r sid cwd title; do
+      [ -n "$sid" ] || continue
+      printf '  %s  (%s)\n     cd %s && claude --resume %s\n' "${title:-$sid}" "$sid" "$cwd" "$sid"
+    done < "$file"
+    return 0
+  fi
+  require_macos
+  osascript -e 'id of app "iTerm"' >/dev/null 2>&1 \
+    || die "iTerm2 not found — this version restores into iTerm2 only."
+  osa='tell application "iTerm2"
+  activate
+  set w to (create window with default profile)
+'
+  while IFS=$'\t' read -r sid cwd title; do
+    [ -n "$sid" ] || continue
+    cmd="cd \\\"$cwd\\\" && claude --resume $sid"
+    if [ "$first" = 1 ]; then
+      osa+="  tell current session of w to write text \"$cmd\"
+"
+      first=0
+    else
+      osa+="  tell w to create tab with default profile
+  tell current session of w to write text \"$cmd\"
+"
+    fi
+  done < "$file"
+  osa+='end tell'
+  printf '%s\n' "$osa" | osascript -
+  echo "restore: launched $n tab(s) from $stem."
+}
+
 cmd_restore() {
   local dry=0 yes=0 mode="default" id=""
   while [ $# -gt 0 ]; do
@@ -278,9 +315,20 @@ cmd_restore() {
     show) show_snapshot "$id"; return 0 ;;
   esac
 
-  # launch modes handled in Task 8 (dry/yes are consumed there)
-  : "$dry" "$yes"
-  die "restore: launch not wired yet"
+  : "$yes"  # reserved for the confirmation prompt added in Task 9
+  local file=""
+  case "$mode" in
+    latest)
+      file="$(newest_history)"; [ -n "$file" ] || file="$SNAPSHOT" ;;
+    snapshot)
+      file="$(resolve_id "$id")" \
+        || die "no snapshot matching '$id' (see: cc-session-restore restore --list)" ;;
+    default)
+      file="$(select_default)"
+      [ -n "$file" ] || file="$SNAPSHOT" ;;
+  esac
+  [ -n "$file" ] && [ -s "$file" ] || die "nothing to restore"
+  launch_file "$file" "$dry"
 }
 
 # --- launch agent ------------------------------------------------------------
