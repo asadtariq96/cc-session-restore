@@ -143,6 +143,23 @@ EOF
   rm -f "$all" "$keep"
 }
 
+# One-time migration: if there's no history yet but a legacy snapshot.tsv
+# exists, preserve it as the first history entry (tagged with the current boot).
+seed_history_from_snapshot() {
+  [ -n "$(newest_history)" ] && return 0
+  [ -s "$SNAPSHOT" ] || return 0
+  local cur ts
+  cur="$(current_boot)"; ts="$(now_ts)"
+  mkdir -p "$STATE_DIR/history"
+  cp "$SNAPSHOT" "$STATE_DIR/history/$cur-$ts.tsv"
+}
+
+record_snapshot() { # $1 = candidate tsv (may be empty)
+  seed_history_from_snapshot
+  append_snapshot "$1"
+  prune_history
+}
+
 # --- snapshot ----------------------------------------------------------------
 cmd_snapshot() {
   require_macos
@@ -169,12 +186,13 @@ cmd_snapshot() {
   done
 
   local n; n="$(grep -c . "$tmp" 2>/dev/null || true)"; n="${n:-0}"
-  # don't clobber a good snapshot with an empty one (e.g. run mid-shutdown)
-  if [ "$n" -eq 0 ] && [ -s "$SNAPSHOT" ]; then
-    rm -f "$tmp"; echo "snapshot: 0 live sessions; kept existing $SNAPSHOT"; return 0
+  record_snapshot "$tmp"
+  rm -f "$tmp"
+  if [ "$n" -eq 0 ]; then
+    echo "snapshot: 0 live sessions; kept existing history"
+  else
+    echo "snapshot: captured $n live session(s) -> history"
   fi
-  mv "$tmp" "$SNAPSHOT"
-  echo "snapshot: captured $n live session(s) -> $SNAPSHOT"
 }
 
 # --- restore -----------------------------------------------------------------
