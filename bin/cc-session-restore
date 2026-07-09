@@ -72,6 +72,26 @@ boot_of_file() { # path -> boot prefix
   printf '%s\n' "${b%%-*}"
 }
 
+# --- selection ---------------------------------------------------------------
+# Default restore target: newest snapshot from a boot other than the current
+# one (i.e. the set open before this reboot); else the newest overall.
+select_default() {
+  local cur f newest="" last_other=""
+  cur="$(current_boot)"
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    newest="$f"
+    if [ "$(boot_of_file "$f")" != "$cur" ]; then
+      last_other="$f"
+    fi
+  done < <(history_files)
+  if [ -n "$last_other" ]; then
+    printf '%s\n' "$last_other"
+  elif [ -n "$newest" ]; then
+    printf '%s\n' "$newest"
+  fi
+}
+
 # --- snapshot ----------------------------------------------------------------
 cmd_snapshot() {
   require_macos
