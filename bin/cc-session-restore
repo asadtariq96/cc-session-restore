@@ -112,6 +112,37 @@ append_snapshot() { # $1 = candidate tsv (may be empty/zero-length)
   cp "$cand" "$SNAPSHOT"
 }
 
+# Keep newest CCSR_HISTORY_LIMIT entries plus the newest entry of each of the
+# last CCSR_KEEP_BOOTS boots. Bash-3.2 safe: uses temp files, not hash sets.
+prune_history() {
+  local limit="${CCSR_HISTORY_LIMIT:-50}" keepboots="${CCSR_KEEP_BOOTS:-10}"
+  local all keep total boots b nf f
+  all="$(mktemp)"; keep="$(mktemp)"
+  history_files > "$all"
+  total="$(grep -c . "$all" 2>/dev/null || printf '0')"
+  if [ "$total" -le "$limit" ]; then
+    rm -f "$all" "$keep"
+    return 0
+  fi
+  # newest `limit`
+  tail -n "$limit" "$all" >> "$keep"
+  # last `keepboots` distinct boots (ascending), newest file of each
+  boots="$(while IFS= read -r f; do boot_of_file "$f"; done < "$all" \
+           | awk '!seen[$0]++' | tail -n "$keepboots")"
+  while IFS= read -r b; do
+    [ -n "$b" ] || continue
+    nf="$(grep "/$b-" "$all" | tail -n 1)"
+    [ -n "$nf" ] && printf '%s\n' "$nf" >> "$keep"
+  done <<EOF
+$boots
+EOF
+  sort -u "$keep" -o "$keep"
+  while IFS= read -r f; do
+    grep -qxF "$f" "$keep" || rm -f "$f"
+  done < "$all"
+  rm -f "$all" "$keep"
+}
+
 # --- snapshot ----------------------------------------------------------------
 cmd_snapshot() {
   require_macos
