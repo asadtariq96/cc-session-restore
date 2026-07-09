@@ -92,6 +92,65 @@ select_default() {
   fi
 }
 
+# Resolve an id (newest-first index from --list, or a unique filename-stem
+# substring) to a history file path. Nonzero if no unique match.
+resolve_id() { # $1 = id
+  local id="$1" total match c
+  total="$(history_files | grep -c . )"
+  case "$id" in
+    ''|*[!0-9]*) : ;;                        # not a pure integer
+    *)
+      if [ "$id" -ge 1 ] && [ "$id" -le "$total" ]; then
+        history_files | sed -n "$((total - id + 1))p"   # newest-first
+        return 0
+      fi
+      ;;
+  esac
+  match="$(history_files | while IFS= read -r f; do
+    case "$(basename "$f")" in (*"$id"*) printf '%s\n' "$f" ;; esac
+  done)"
+  c="$(printf '%s\n' "$match" | grep -c . )"
+  if [ "$c" = 1 ]; then printf '%s\n' "$match"; return 0; fi
+  return 1
+}
+
+# YYYYMMDDTHHMMSS -> "YYYY-MM-DD HH:MM"
+_human_ts() {
+  sed -E 's/^([0-9]{4})([0-9]{2})([0-9]{2})T([0-9]{2})([0-9]{2}).*/\1-\2-\3 \4:\5/'
+}
+
+list_history() {
+  local total idx i f base boot ts count cur def human marker star
+  cur="$(current_boot)"
+  total="$(history_files | grep -c . )"
+  if [ "$total" -eq 0 ]; then echo "(no snapshots yet)"; return 0; fi
+  def="$(select_default)"
+  printf '   %-3s %-16s  %-10s  %-8s  %s\n' "#" "captured" "boot" "count" "id"
+  idx=0
+  while [ "$idx" -lt "$total" ]; do
+    i=$((idx + 1))
+    f="$(history_files | sed -n "$((total - idx))p")"   # newest-first
+    base="$(basename "$f" .tsv)"; boot="${base%%-*}"; ts="${base#*-}"
+    count="$(grep -c . "$f")"
+    if [ "$boot" = "$cur" ]; then marker="this-boot"; else marker="prior-boot"; fi
+    if [ "$f" = "$def" ]; then star="*"; else star=" "; fi
+    human="$(printf '%s' "$ts" | _human_ts)"
+    printf ' %s %-3s %-16s  %-10s  %-8s  %s\n' "$star" "$i" "$human" "$marker" "$count" "$base"
+    idx=$((idx + 1))
+  done
+  echo
+  echo "* = default target for 'restore'"
+}
+
+show_snapshot() { # $1 = id
+  local f sid cwd title
+  f="$(resolve_id "$1")" || die "no snapshot matching '$1' (see: cc-session-restore restore --list)"
+  while IFS=$'\t' read -r sid cwd title; do
+    [ -n "$sid" ] || continue
+    printf '%s\n   cd %s && claude --resume %s\n' "${title:-$sid}" "$cwd" "$sid"
+  done < "$f"
+}
+
 # Append CANDIDATE to history unless it duplicates the newest same-boot entry.
 # Always refresh snapshot.tsv from a non-empty candidate. Empty = no-op.
 append_snapshot() { # $1 = candidate tsv (may be empty/zero-length)
@@ -197,45 +256,31 @@ cmd_snapshot() {
 
 # --- restore -----------------------------------------------------------------
 cmd_restore() {
-  require_macos
-  local dry=0
-  [ "${1:-}" = "--dry-run" ] && dry=1
-  [ -s "$SNAPSHOT" ] || die "no snapshot at $SNAPSHOT (run: cc-session-restore snapshot)"
+  local dry=0 yes=0 mode="default" id=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --dry-run)  dry=1 ;;
+      -y|--yes)   yes=1 ;;
+      --latest)   mode="latest" ;;
+      --list)     mode="list" ;;
+      --show)     mode="show"; shift; id="${1:-}"; [ -n "$id" ] || die "restore --show needs an id" ;;
+      --snapshot) mode="snapshot"; shift; id="${1:-}"; [ -n "$id" ] || die "restore --snapshot needs an id" ;;
+      *) die "restore: unknown option '$1'" ;;
+    esac
+    shift
+  done
 
-  if [ "$dry" = 1 ]; then
-    echo "restore (dry-run): $(grep -c . "$SNAPSHOT") session(s)"
-    local sid cwd title
-    while IFS=$'\t' read -r sid cwd title; do
-      [ -n "$sid" ] || continue
-      printf '  %s  (%s)\n     cd %s && claude --resume %s\n' "$title" "$sid" "$cwd" "$sid"
-    done < "$SNAPSHOT"
-    return 0
-  fi
+  [ -n "$(newest_history)" ] || [ -s "$SNAPSHOT" ] \
+    || die "no snapshots yet (run: cc-session-restore snapshot)"
 
-  osascript -e 'id of app "iTerm"' >/dev/null 2>&1 \
-    || die "iTerm2 not found — this version restores into iTerm2 only."
+  case "$mode" in
+    list) list_history; return 0 ;;
+    show) show_snapshot "$id"; return 0 ;;
+  esac
 
-  local osa first=1 sid cwd title cmd
-  osa='tell application "iTerm2"
-  activate
-  set w to (create window with default profile)
-'
-  while IFS=$'\t' read -r sid cwd title; do
-    [ -n "$sid" ] || continue
-    cmd="cd \\\"$cwd\\\" && claude --resume $sid"
-    if [ "$first" = 1 ]; then
-      osa+="  tell current session of w to write text \"$cmd\"
-"
-      first=0
-    else
-      osa+="  tell w to create tab with default profile
-  tell current session of w to write text \"$cmd\"
-"
-    fi
-  done < "$SNAPSHOT"
-  osa+='end tell'
-  printf '%s\n' "$osa" | osascript -
-  echo "restore: launched $(grep -c . "$SNAPSHOT") tab(s)."
+  # launch modes handled in Task 8 (dry/yes are consumed there)
+  : "$dry" "$yes"
+  die "restore: launch not wired yet"
 }
 
 # --- launch agent ------------------------------------------------------------
