@@ -42,6 +42,19 @@ self_path() {
 json_str() { grep -o "\"$2\":\"[^\"]*\"" "$1" 2>/dev/null | head -1 | sed 's/.*:"//; s/"$//'; }
 json_num() { grep -o "\"$2\":[0-9]*"     "$1" 2>/dev/null | head -1 | sed 's/.*://'; }
 
+# --- boot / time primitives --------------------------------------------------
+_parse_boottime() { sed -E 's/^\{ sec = ([0-9]+).*/\1/'; }
+
+current_boot() {
+  if [ -n "${CCSR_BOOT_OVERRIDE:-}" ]; then
+    printf '%s\n' "$CCSR_BOOT_OVERRIDE"
+  else
+    sysctl -n kern.boottime 2>/dev/null | _parse_boottime
+  fi
+}
+
+now_ts() { printf '%s\n' "${CCSR_NOW_OVERRIDE:-$(date -u +%Y%m%dT%H%M%S)}"; }
+
 # --- snapshot ----------------------------------------------------------------
 cmd_snapshot() {
   require_macos
@@ -224,4 +237,7 @@ main() {
     *) err "unknown command: $1"; usage; exit 1 ;;
   esac
 }
-main "$@"
+# Only run when executed, not when sourced (tests source this file).
+if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
+  main "$@"
+fi
