@@ -52,12 +52,18 @@ cc-session-restore snapshot            # capture open sessions now (also runs ev
 cc-session-restore restore --dry-run   # show what would reopen, without launching
 cc-session-restore restore             # reopen everything after a reboot
 cc-session-restore restore --force     # also reopen sessions that are still running
+cc-session-restore restore --launch-flags-only   # ignore mode switches made during the session
 ```
 
 `restore` skips any session that is still open, so running it twice does not stack a second
 tab on top of a working one, and running it after a partial reboot only fills the gaps.
 `--dry-run` prints the exact command each tab would get, plus the flags it filtered out —
 worth a look the first time.
+
+The permission mode comes back as the session left it, not as it was launched. A tab started
+plainly and switched to bypass with shift-tab reopens in bypass, which is more than its
+original command line asked for — so `--dry-run` names the mode for every session on a line of
+its own, and `--launch-flags-only` goes back to reading the mode off the launch flags alone.
 
 Typical flow: do nothing special before restarting, since the agent keeps a fresh snapshot.
 After logging back in, run `cc-session-restore restore`.
@@ -85,6 +91,12 @@ can change this later under System Settings > Privacy & Security > Automation.
 - Every other flag carries over without this tool knowing its name. A bare token is read as
   the previous flag's value when it follows a flag, and as the prompt otherwise, so a flag
   introduced by a future Claude Code release arrives with its value intact.
+- The permission mode is read from the transcript rather than from argv, because shift-tab and
+  `/permissions` change it mid-session and the command line never finds out. Claude Code
+  journals every switch, so the last such record is the mode the session was sitting in when it
+  closed. `--dangerously-skip-permissions` does not come back — it overrides `--permission-mode`
+  outright — and is replaced by `--allow-dangerously-skip-permissions`, which keeps bypass
+  reachable in the tab's shift-tab cycle without switching to it.
 - Sessions that are not terminal tabs are left alone: hooks and SDK callers run
   `claude --print ...` and register as `entrypoint: sdk-cli`. So are sessions Claude Code
   has not journalled yet — `--resume` has nothing to find for those.
@@ -120,8 +132,6 @@ cc-session-restore uninstall            # removes the agent and state, prints th
 - A prompt typed on the command line is normally dropped, but one sitting directly behind a
   boolean or variadic flag (`claude --ide "fix the tests"`, `claude --add-dir /a "fix it"`)
   cannot be told apart from that flag's value, so it rides along into the restored tab.
-- The permission mode a session ends up in (`/permissions`, shift-tab) is not restored —
-  only the mode it was launched with, if that was a command-line flag.
 
 ## License
 

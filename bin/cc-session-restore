@@ -183,6 +183,13 @@ filter_args() {
   CCSR_KEPT=""
   CCSR_DROPPED=""
   local t base next flag=0
+  local drop_bare="$CCSR_DROP_BARE" drop_val="$CCSR_DROP_VAL"
+  # once the session's real permission mode is known, whatever argv asked for is
+  # stale — drop it here, re-add the mode that was read in build_cmd
+  if [ "$CCSR_DROP_PERM" = 1 ]; then
+    drop_bare="$drop_bare $CCSR_PERM_DROP_BARE"
+    drop_val="$drop_val $CCSR_PERM_DROP_VAL"
+  fi
   while [ "$#" -gt 0 ]; do
     t="$1"; shift
     # --flag=value arrives as one token and carries its own value
@@ -199,10 +206,10 @@ filter_args() {
       if [ "$t" = "$base" ]; then
         case "$next" in ""|-*) ;; *) drop_tok "$next"; shift ;; esac
       fi
-    elif in_list "$base" "$CCSR_DROP_VAL"; then
+    elif in_list "$base" "$drop_val"; then
       drop_tok "$t"; flag=0
       if [ "$t" = "$base" ] && [ "$#" -gt 0 ]; then drop_tok "$next"; shift; fi
-    elif in_list "$base" "$CCSR_DROP_BARE"; then
+    elif in_list "$base" "$drop_bare"; then
       drop_tok "$t"; flag=0
     elif in_list "$base" "$CCSR_KEEP_MANY"; then
       keep_tok "$t"; flag=0
@@ -229,12 +236,64 @@ filter_args() {
   done
 }
 
-# build_cmd <sid> <cwd> <title> <nameSource> <argv> -> sets CCSR_CMD, CCSR_DROPPED
+# --- permission mode ---------------------------------------------------------
+# The mode a session ends in is rarely the mode it was launched with — shift-tab
+# and /permissions change it and argv never learns. Claude Code journals every
+# switch to the transcript as a record of its own, so the last one is the mode
+# the session was actually sitting in when it died.
+#
+# `default` is missing from the "Allowed choices" the CLI prints for a bad
+# --permission-mode, but the transcript writes it and `claude --permission-mode
+# default` is accepted (measured on 2.1.266), so it belongs here.
+CCSR_MODES="default acceptEdits auto bypassPermissions manual dontAsk plan"
+
+# `--dangerously-skip-permissions` overrides `--permission-mode` outright —
+# measured: `--dangerously-skip-permissions --permission-mode manual` still runs
+# Bash unprompted — so it cannot come back alongside a restored mode. Its
+# `--allow-` sibling only keeps bypass reachable in the shift-tab cycle without
+# switching to it, which is what a restored non-bypass mode needs.
+CCSR_PERM_DROP_BARE="--dangerously-skip-permissions --allow-dangerously-skip-permissions"
+CCSR_PERM_DROP_VAL="--permission-mode"
+
+CCSR_DROP_PERM=0          # set per session by build_cmd, read by filter_args
+CCSR_LAUNCH_FLAGS_ONLY=0  # `restore --launch-flags-only` goes back to reading argv alone
+CCSR_MODE=""
+
+# last_permission_mode <sessionId> -> prints the mode the session ended in, or nothing
+last_permission_mode() {
+  local sid="$1" f m transcripts
+  transcripts=("$CLAUDE_CONFIG_DIR"/projects/*/"$sid".jsonl)
+  for f in "${transcripts[@]}"; do
+    [ -f "$f" ] || continue
+    # `tail -r` (BSD, in /usr/bin, so inside this script's trimmed PATH) reverses
+    # the file, which turns "last record" into "first match" — ~5ms on a 1MB
+    # transcript instead of a full scan. Its exit status is no use: grep -m1
+    # closes the pipe and tail dies on SIGPIPE, so the match is judged by content.
+    m="$(tail -r "$f" 2>/dev/null | grep -m1 -o '"type":"permission-mode","permissionMode":"[a-zA-Z]*"')"
+    [ -n "$m" ] || continue
+    m="${m##*:\"}"; m="${m%\"}"
+    # a mode from a newer Claude Code than this script knows about: leave the
+    # command alone rather than build one the CLI will refuse to start
+    in_list "$m" "$CCSR_MODES" || continue
+    printf '%s' "$m"
+    return 0
+  done
+  return 1
+}
+
+# build_cmd <sid> <cwd> <title> <nameSource> <argv> -> sets CCSR_CMD, CCSR_DROPPED, CCSR_MODE
 build_cmd() {
   local sid="$1" cwd="$2" title="$3" nsrc="$4" args="$5"
-  local launcher argv0 name_opt=""
+  local launcher argv0 name_opt="" perm_opt="" allow=0
   CCSR_KEPT=""
   CCSR_DROPPED=""
+  CCSR_MODE=""
+  CCSR_DROP_PERM=0
+
+  if [ "$CCSR_LAUNCH_FLAGS_ONLY" = 0 ]; then
+    CCSR_MODE="$(last_permission_mode "$sid")"
+    [ -n "$CCSR_MODE" ] && CCSR_DROP_PERM=1
+  fi
 
   if [ -n "$args" ]; then
     # ps already joined argv with spaces; re-split it the same way the shell will
@@ -260,7 +319,18 @@ build_cmd() {
     *) [ -n "$title" ] && name_opt=" -n $(q "$title")" ;;
   esac
 
-  CCSR_CMD="cd $(q "$cwd") && ${launcher}${CCSR_KEPT}${name_opt} --resume ${sid}"
+  if [ -n "$CCSR_MODE" ]; then
+    # bypass belongs in the restored tab's shift-tab cycle if the command line
+    # allowed it — or if the session ended in it, which proves it was allowed.
+    case " $args " in
+      *" --dangerously-skip-permissions "*|*" --allow-dangerously-skip-permissions "*) allow=1 ;;
+    esac
+    [ "$CCSR_MODE" = bypassPermissions ] && allow=1
+    [ "$allow" = 1 ] && perm_opt=" --allow-dangerously-skip-permissions"
+    perm_opt="$perm_opt --permission-mode $CCSR_MODE"
+  fi
+
+  CCSR_CMD="cd $(q "$cwd") && ${launcher}${CCSR_KEPT}${name_opt}${perm_opt} --resume ${sid}"
 }
 
 # --- restore -----------------------------------------------------------------
@@ -271,7 +341,8 @@ cmd_restore() {
     case "$a" in
       --dry-run) dry=1 ;;
       --force)   force=1 ;;
-      *) die "usage: cc-session-restore restore [--dry-run] [--force]" ;;
+      --launch-flags-only) CCSR_LAUNCH_FLAGS_ONLY=1 ;;
+      *) die "usage: cc-session-restore restore [--dry-run] [--force] [--launch-flags-only]" ;;
     esac
   done
   [ -s "$SNAPSHOT" ] || die "no snapshot at $SNAPSHOT (run: cc-session-restore snapshot)"
@@ -280,7 +351,7 @@ cmd_restore() {
   local live=" "
   [ "$force" = 1 ] || live="$(live_sids)"
 
-  local osa first=1 sid cwd title nsrc args esc
+  local osa first=1 sid cwd title nsrc args esc mode
   local launched=0 skipped=0
   osa='tell application "iTerm2"
   activate
@@ -293,7 +364,12 @@ cmd_restore() {
     case "$live" in
       *" $sid "*)
         skipped=$((skipped + 1))
-        [ "$dry" = 1 ] && printf '  %s  (%s)\n     skip — already running\n' "$title" "$sid"
+        if [ "$dry" = 1 ]; then
+          printf '  %s  (%s)\n     skip — already running\n' "$title" "$sid"
+          mode=""
+          [ "$CCSR_LAUNCH_FLAGS_ONLY" = 1 ] || mode="$(last_permission_mode "$sid")"
+          [ -n "$mode" ] && printf '     permission mode: %s\n' "$mode"
+        fi
         continue
         ;;
     esac
@@ -303,6 +379,7 @@ cmd_restore() {
 
     if [ "$dry" = 1 ]; then
       printf '  %s  (%s)\n     %s\n' "$title" "$sid" "$CCSR_CMD"
+      [ -n "$CCSR_MODE" ] && printf '     permission mode: %s (restored from transcript)\n' "$CCSR_MODE"
       [ -n "$CCSR_DROPPED" ] && printf '     dropped:%s\n' "$CCSR_DROPPED"
       continue
     fi
@@ -424,6 +501,9 @@ COMMANDS:
   restore [options]     Reopen one iTerm2 window with a tab per snapshotted session
       --dry-run         Print the commands that would run, and what was filtered out
       --force           Also reopen sessions that are still running (default: skip them)
+      --launch-flags-only
+                        Restore the permission mode from the launch flags only,
+                        ignoring the mode the session was switched to
   status                Show config / snapshot / agent status
   agent install         Install + load the 60s auto-snapshot LaunchAgent
   agent uninstall       Unload + remove the LaunchAgent
