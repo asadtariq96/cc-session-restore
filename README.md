@@ -53,6 +53,7 @@ cc-session-restore restore --dry-run   # show what would reopen, without launchi
 cc-session-restore restore             # reopen everything after a reboot
 cc-session-restore restore --force     # also reopen sessions that are still running
 cc-session-restore restore --launch-flags-only   # ignore mode switches made during the session
+cc-session-restore restore --include-closed       # also reopen tabs closed since this boot
 ```
 
 `restore` skips any session that is still open, so running it twice does not stack a second
@@ -76,12 +77,21 @@ can change this later under System Settings > Privacy & Security > Automation.
 ## How it works
 
 - `~/.claude/sessions/<PID>.json` is Claude Code's own live map of running sessions
-  (`pid`, `sessionId`, `cwd`, `name`, `status`). `snapshot` reads it and keeps only entries
-  whose PID is still a live `claude` process, writing them to
-  `${XDG_STATE_HOME:-~/.local/state}/cc-session-restore/snapshot.tsv`.
+  (`pid`, `sessionId`, `cwd`, `name`, `status`). `snapshot` reads it and writes one row per
+  session to `${XDG_STATE_HOME:-~/.local/state}/cc-session-restore/snapshot.tsv`.
+- A session whose process is gone keeps its row, marked `gone`, along with the time it was
+  last seen running and the boot it was seen under. `restore` reopens such a row only when
+  that boot is no longer the one running — a session that vanished while this boot was
+  already up was closed, not lost, and reopening it every time would make closing a tab
+  impossible. `--include-closed` overrides that, which is the way back from a tab, or a
+  window, closed by mistake. Gone rows are dropped after `CCSR_GONE_DAYS` days.
+- The directory a tab reopens in is the one its session *started* in, taken from the first
+  record of the transcript. Every cwd Claude Code publishes — the session JSON, the latest
+  transcript record, the process itself — moves with the session, so a tab opened in `~`
+  that spent an hour in a subdirectory would otherwise come back there instead.
 - Launch flags are not in that file, nor anywhere else on disk — argv exists only in the
   running process. `snapshot` reads it with `ps` while the PID is alive and stores it in the
-  snapshot's fifth column.
+  snapshot's last column.
 - `restore` builds an AppleScript that opens one iTerm2 window and one tab per row, each
   running `cd <cwd> && command claude <flags> --resume <id>`. Flags that would fight with
   `--resume` are dropped first: `--resume`, `--continue`, `--session-id`, `--fork-session`,
@@ -101,9 +111,10 @@ can change this later under System Settings > Privacy & Security > Automation.
   `claude --print ...` and register as `entrypoint: sdk-cli`. So are sessions Claude Code
   has not journalled yet — `--resume` has nothing to find for those.
 
-Closed tabs drop out of the next 60s snapshot, so there's nothing to prune by hand. An
-unexpected reboot loses at most ~60s of "which tabs were open", and never loses a
-conversation.
+An unexpected reboot loses at most ~60s of "which tabs were open", and never loses a
+conversation. Neither does closing a tab by accident: its row stays for a week, so
+`restore --include-closed --dry-run` still knows what was open and prints the command that
+brings it back.
 
 ## Configuration
 
@@ -111,6 +122,7 @@ conversation.
 |---|---|---|
 | `CLAUDE_CONFIG_DIR` | `~/.claude` | Where Claude stores its config and sessions |
 | `XDG_STATE_HOME` | `~/.local/state` | Where the snapshot is written |
+| `CCSR_GONE_DAYS` | `7` | How long a session that stopped running stays in the snapshot |
 | `CCSR_BIN_DIR` | `~/.local/bin` | Install location (installer) |
 
 ## Uninstall

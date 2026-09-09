@@ -24,6 +24,8 @@ export PATH=/usr/bin:/bin:/usr/sbin:/sbin
 
 # --- paths -------------------------------------------------------------------
 : "${CLAUDE_CONFIG_DIR:=$HOME/.claude}"
+# how long a session that is no longer running stays in the snapshot
+: "${CCSR_GONE_DAYS:=7}"
 SESSIONS_DIR="$CLAUDE_CONFIG_DIR/sessions"
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/cc-session-restore"
 SNAPSHOT="$STATE_DIR/snapshot.tsv"
@@ -72,18 +74,63 @@ live_sids() {
 }
 
 # --- snapshot ----------------------------------------------------------------
-# Snapshot format (TSV, 5 columns):
-#   sessionId <TAB> cwd <TAB> title <TAB> nameSource <TAB> argv
+# Snapshot format: one `#` header line, then TSV rows of 8 columns:
+#   sessionId <TAB> cwd <TAB> title <TAB> nameSource <TAB> status <TAB> seenAt <TAB> boot <TAB> argv
 # argv comes last so `read` can take the rest of the line in one go. Rows written
-# by older versions have 3 columns; they still restore, just without flags.
+# by older versions have 3 or 5 columns and are padded on read (snapshot_rows).
+#
+# A session that no longer has a process keeps its row, marked `gone`. Dropping
+# it was cheap to write and expensive to live with: a tab closed by mistake
+# stopped existing 60 seconds later with nothing left to reopen it from, and a
+# session started after a reboot but before `restore` overwrote the whole set.
+# `seenAt` is the last snapshot that still saw the session running and `boot` is
+# the kernel boot time at that moment — which is how restore tells a session that
+# went down with the machine from one that was closed by hand.
+#
+# No column is ever left empty: an unrecorded value is written as `-`. Tab is an
+# IFS whitespace character, so `IFS=$'\t' read` collapses two adjacent tabs into
+# one delimiter and every field after the gap shifts left — an empty column would
+# quietly hand argv to the boot variable.
+SNAPSHOT_HEADER="# cc-session-restore snapshot v2 | sessionId, cwd, title, nameSource, status, seenAt, boot, argv (- = not recorded)"
+
+# `{ sec = 1784826415, usec = 789554 } Thu Jul 23 20:06:55 2026`. The character
+# class in front of `sec` is what keeps the greedy `.*` off the `usec` field —
+# without it this reads back microseconds. An unreadable boot time yields nothing,
+# and a row with no boot recorded is treated as lost rather than closed, which is
+# the safe direction to be wrong in.
+boot_epoch() { sysctl -n kern.boottime 2>/dev/null | sed -n 's/.*[{ ]sec *= *\([0-9][0-9]*\).*/\1/p'; }
+
+ts_human() {
+  case "$1" in
+    ''|*[!0-9]*) printf '?' ;;
+    *) date -r "$1" '+%Y-%m-%d %H:%M' 2>/dev/null || printf '?' ;;
+  esac
+}
+
+# Snapshot rows without the header, every row padded to 8 columns. A file written
+# by an older version reads back as live rows with no boot recorded, which is
+# what makes them restorable exactly as they were before.
+snapshot_rows() {
+  [ -s "$SNAPSHOT" ] || return 0
+  awk -F'\t' -v OFS='\t' -v now="$(date +%s)" '
+    /^#/ || NF == 0 { next }
+    NF <= 5 { $8 = $5; $5 = "live"; $6 = now; $7 = "" }
+    { for (i = 1; i <= 8; i++) if ($i == "") $i = "-"; NF = 8; print }
+  ' "$SNAPSHOT"
+}
+
 cmd_snapshot() {
   require_macos
   [ -d "$SESSIONS_DIR" ] || die "Claude session dir not found: $SESSIONS_DIR
 (Is Claude Code installed and recent enough? Set CLAUDE_CONFIG_DIR if you relocated ~/.claude.)"
   mkdir -p "$STATE_DIR"
   local tmp; tmp="$(mktemp "$STATE_DIR/.snap.XXXXXX")"
-  local claimed=" " f pid sid cwd name nsrc entry comm title args
+  local claimed=" " f pid sid cwd start_cwd name nsrc entry comm title args
   local transcripts
+  local now boot; now="$(date +%s)"; boot="$(boot_epoch)"
+  local n_live=0 n_gone=0 n_expired=0
+
+  printf '%s\n' "$SNAPSHOT_HEADER" > "$tmp"
 
   for f in "$SESSIONS_DIR"/*.json; do
     [ -e "$f" ] || continue
@@ -109,6 +156,14 @@ cmd_snapshot() {
     transcripts=("$CLAUDE_CONFIG_DIR"/projects/*/"$sid".jsonl)
     [ -f "${transcripts[0]}" ] || continue
     claimed="$claimed$sid "
+    # Every cwd Claude Code publishes — the session JSON, the transcript's latest
+    # record, the process itself — follows the session as it moves, so a tab
+    # opened in ~ that spent the session in a subdirectory would reopen there.
+    # The directory the tab belongs in is the one it started in, and the only
+    # place that survives is the first record of the transcript. Read through
+    # plutil for the same reason json_get does: the value arrives JSON-escaped.
+    start_cwd="$(grep -m1 '"cwd":' "${transcripts[0]}" 2>/dev/null | plutil -extract cwd raw -o - - 2>/dev/null)"
+    [ -n "$start_cwd" ] && cwd="$(printf '%s' "$start_cwd" | tr '\t\n' '  ')"
     title="${name:-$(basename "$cwd")}"
     # How the session was launched exists nowhere on disk — not in the session
     # JSON, not in the transcript (its permissionMode is the *current* mode), not
@@ -127,16 +182,35 @@ cmd_snapshot() {
     # which is out of reach from bash; the likeliest such argument — the session
     # name — is carried in the nameSource/title columns instead.
     args="$(env LC_ALL= LC_CTYPE=UTF-8 ps -ww -o args= -p "$pid" 2>/dev/null | tr '\t\n' '  ')"
-    printf '%s\t%s\t%s\t%s\t%s\n' "$sid" "$cwd" "$title" "$nsrc" "$args" >> "$tmp"
+    [ -n "$nsrc" ] || nsrc="-"
+    [ -n "$boot" ] || boot="-"
+    [ -n "$args" ] || args="-"
+    printf '%s\t%s\t%s\t%s\tlive\t%s\t%s\t%s\n' "$sid" "$cwd" "$title" "$nsrc" "$now" "$boot" "$args" >> "$tmp"
+    n_live=$((n_live + 1))
   done
 
-  local n; n="$(grep -c . "$tmp" 2>/dev/null || true)"; n="${n:-0}"
-  # don't clobber a good snapshot with an empty one (e.g. run mid-shutdown)
-  if [ "$n" -eq 0 ] && [ -s "$SNAPSHOT" ]; then
-    rm -f "$tmp"; echo "snapshot: 0 live sessions; kept existing $SNAPSHOT"; return 0
-  fi
+  # Everything the previous snapshot knew about and that has no process now is
+  # carried across, marked `gone`, with the timestamps of its last sighting left
+  # untouched — that sighting is the answer to "when did this disappear", and
+  # re-stamping it each tick would push the row out of the keep-window never.
+  # This also replaces the old "don't clobber a good snapshot with an empty one"
+  # guard: an empty run no longer erases anything, it just tombstones.
+  local ttl=$((CCSR_GONE_DAYS * 86400))
+  local osid ocwd otitle onsrc ostatus oseen oboot oargs
+  while IFS=$'\t' read -r osid ocwd otitle onsrc ostatus oseen oboot oargs; do
+    [ -n "$osid" ] || continue
+    case "$claimed" in *" $osid "*) continue ;; esac
+    case "$oseen" in ''|*[!0-9]*) oseen="$now" ;; esac
+    if [ "$ostatus" = gone ] && [ "$((now - oseen))" -gt "$ttl" ]; then
+      n_expired=$((n_expired + 1)); continue
+    fi
+    printf '%s\t%s\t%s\t%s\tgone\t%s\t%s\t%s\n' "$osid" "$ocwd" "$otitle" "$onsrc" "$oseen" "$oboot" "$oargs" >> "$tmp"
+    n_gone=$((n_gone + 1))
+  done < <(snapshot_rows)
+
   mv "$tmp" "$SNAPSHOT"
-  echo "snapshot: captured $n live session(s) -> $SNAPSHOT"
+  printf 'snapshot: %s live, %s gone, %s expired past %s day(s) -> %s\n' \
+    "$n_live" "$n_gone" "$n_expired" "$CCSR_GONE_DAYS" "$SNAPSHOT"
 }
 
 # --- argv filtering ----------------------------------------------------------
@@ -336,13 +410,14 @@ build_cmd() {
 # --- restore -----------------------------------------------------------------
 cmd_restore() {
   require_macos
-  local dry=0 force=0 a
+  local dry=0 force=0 want_closed=0 a
   for a in "$@"; do
     case "$a" in
       --dry-run) dry=1 ;;
       --force)   force=1 ;;
+      --include-closed) want_closed=1 ;;
       --launch-flags-only) CCSR_LAUNCH_FLAGS_ONLY=1 ;;
-      *) die "usage: cc-session-restore restore [--dry-run] [--force] [--launch-flags-only]" ;;
+      *) die "usage: cc-session-restore restore [--dry-run] [--force] [--include-closed] [--launch-flags-only]" ;;
     esac
   done
   [ -s "$SNAPSHOT" ] || die "no snapshot at $SNAPSHOT (run: cc-session-restore snapshot)"
@@ -350,17 +425,22 @@ cmd_restore() {
   # sessions that are already open don't need a second tab pointing at them
   local live=" "
   [ "$force" = 1 ] || live="$(live_sids)"
+  local boot; boot="$(boot_epoch)"
 
-  local osa first=1 sid cwd title nsrc args esc mode
-  local launched=0 skipped=0
+  local osa first=1 sid cwd title nsrc status seen sboot args esc mode
+  local launched=0 skipped=0 closed=0
   osa='tell application "iTerm2"
   activate
   set w to (create window with default profile)
 '
-  [ "$dry" = 1 ] && echo "restore (dry-run): $(grep -c . "$SNAPSHOT") session(s)"
+  [ "$dry" = 1 ] && echo "restore (dry-run): $(snapshot_rows | grep -c .) session(s)"
 
-  while IFS=$'\t' read -r sid cwd title nsrc args; do
+  while IFS=$'\t' read -r sid cwd title nsrc status seen sboot args; do
     [ -n "$sid" ] || continue
+    [ "$title" = - ] && title=""
+    [ "$nsrc"  = - ] && nsrc=""
+    [ "$sboot" = - ] && sboot=""
+    [ "$args"  = - ] && args=""
     case "$live" in
       *" $sid "*)
         skipped=$((skipped + 1))
@@ -374,11 +454,25 @@ cmd_restore() {
         ;;
     esac
 
+    # A session that disappeared while the boot now running was already up was
+    # closed rather than lost — bringing it back on every restore would make
+    # closing a tab impossible. One whose last sighting belongs to an earlier
+    # boot went down with the machine, which is the case this tool exists for.
+    # A row from an older snapshot format has no boot recorded and so is always
+    # treated as lost, exactly as it was before the column existed.
+    if [ "$status" = gone ] && [ "$want_closed" = 0 ] && [ -n "$sboot" ] && [ "$sboot" = "$boot" ]; then
+      closed=$((closed + 1))
+      [ "$dry" = 1 ] && printf '  %s  (%s)\n     skip — closed %s, this boot (--include-closed to reopen)\n' \
+        "$title" "$sid" "$(ts_human "$seen")"
+      continue
+    fi
+
     build_cmd "$sid" "$cwd" "$title" "$nsrc" "$args"
     launched=$((launched + 1))
 
     if [ "$dry" = 1 ]; then
       printf '  %s  (%s)\n     %s\n' "$title" "$sid" "$CCSR_CMD"
+      [ "$status" = gone ] && printf '     gone — last seen %s\n' "$(ts_human "$seen")"
       [ -n "$CCSR_MODE" ] && printf '     permission mode: %s (restored from transcript)\n' "$CCSR_MODE"
       [ -n "$CCSR_DROPPED" ] && printf '     dropped:%s\n' "$CCSR_DROPPED"
       continue
@@ -395,23 +489,26 @@ cmd_restore() {
   tell current session of w to write text \"$esc\"
 "
     fi
-  done < "$SNAPSHOT"
+  done < <(snapshot_rows)
   osa+='end tell'
 
   if [ "$dry" = 1 ]; then
-    printf 'restore (dry-run): would launch %s tab(s), skip %s already running\n' "$launched" "$skipped"
+    printf 'restore (dry-run): would launch %s tab(s), skip %s already running, %s closed this boot\n' \
+      "$launched" "$skipped" "$closed"
     return 0
   fi
 
   if [ "$launched" -eq 0 ]; then
-    echo "restore: nothing to do — all $skipped snapshotted session(s) are already running."
+    printf 'restore: nothing to reopen — %s session(s) already running, %s closed during this boot.\n' \
+      "$skipped" "$closed"
     return 0
   fi
 
   osascript -e 'id of app "iTerm"' >/dev/null 2>&1 \
     || die "iTerm2 not found — this version restores into iTerm2 only."
   printf '%s\n' "$osa" | osascript -
-  printf 'restore: launched %s tab(s), skipped %s already running.\n' "$launched" "$skipped"
+  printf 'restore: launched %s tab(s), skipped %s already running, %s closed this boot.\n' \
+    "$launched" "$skipped" "$closed"
 }
 
 # --- launch agent ------------------------------------------------------------
@@ -465,11 +562,15 @@ cmd_status() {
   printf 'claude sessions: %s %s\n' "$SESSIONS_DIR" "$found"
   echo "state dir:       $STATE_DIR"
   if [ -s "$SNAPSHOT" ]; then
-    local rows withargs
-    rows="$(grep -c . "$SNAPSHOT")"
-    withargs="$(awk -F'\t' '$5 != "" { n++ } END { print n+0 }' "$SNAPSHOT")"
-    printf 'last snapshot:   %s — %s session(s)\n' "$(stat -f '%Sm' -t '%Y-%m-%d %H:%M' "$SNAPSHOT")" "$rows"
+    local rows n_live n_gone withargs
+    rows="$(snapshot_rows | grep -c . )"
+    n_live="$(snapshot_rows | awk -F'\t' '$5 == "live" { n++ } END { print n+0 }')"
+    n_gone="$(snapshot_rows | awk -F'\t' '$5 == "gone" { n++ } END { print n+0 }')"
+    withargs="$(snapshot_rows | awk -F'\t' '$8 != "" { n++ } END { print n+0 }')"
+    printf 'last snapshot:   %s — %s row(s): %s live, %s gone\n' \
+      "$(stat -f '%Sm' -t '%Y-%m-%d %H:%M' "$SNAPSHOT")" "$rows" "$n_live" "$n_gone"
     printf 'argv captured:   %s of %s row(s)\n' "$withargs" "$rows"
+    printf 'gone rows kept:  %s day(s)\n' "$CCSR_GONE_DAYS"
   else
     echo "last snapshot:   (none)"
   fi
@@ -501,6 +602,7 @@ COMMANDS:
   restore [options]     Reopen one iTerm2 window with a tab per snapshotted session
       --dry-run         Print the commands that would run, and what was filtered out
       --force           Also reopen sessions that are still running (default: skip them)
+      --include-closed  Also reopen sessions that were closed during this boot
       --launch-flags-only
                         Restore the permission mode from the launch flags only,
                         ignoring the mode the session was switched to
