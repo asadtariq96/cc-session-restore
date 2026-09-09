@@ -82,6 +82,9 @@ can change this later under System Settings > Privacy & Security > Automation.
   `--from-pr`, `--cloud`, `--worktree`, `--print`, `--bg` and a trailing prompt argument.
   A session name you set yourself with `-n` is restored from the session JSON rather than
   from argv, so a name with spaces survives.
+- Every other flag carries over without this tool knowing its name. A bare token is read as
+  the previous flag's value when it follows a flag, and as the prompt otherwise, so a flag
+  introduced by a future Claude Code release arrives with its value intact.
 - Sessions that are not terminal tabs are left alone: hooks and SDK callers run
   `claude --print ...` and register as `entrypoint: sdk-cli`. So are sessions Claude Code
   has not journalled yet — `--resume` has nothing to find for those.
@@ -114,6 +117,9 @@ cc-session-restore uninstall            # removes the agent and state, prints th
 - `ps` joins argv with spaces and quotes nothing, so a flag value containing a space (say
   `--append-system-prompt 'be brief'`) comes back split. The common case, `-n`, is handled
   separately; the rest is a known gap.
+- A prompt typed on the command line is normally dropped, but one sitting directly behind a
+  boolean or variadic flag (`claude --ide "fix the tests"`, `claude --add-dir /a "fix it"`)
+  cannot be told apart from that flag's value, so it rides along into the restored tab.
 - The permission mode a session ends up in (`/permissions`, shift-tab) is not restored —
   only the mode it was launched with, if that was a command-line flag.
 

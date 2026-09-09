@@ -148,12 +148,10 @@ CCSR_DROP_OPTVAL="-r --resume --from-pr --cloud --teleport -w --worktree"
 CCSR_DROP_VAL="--session-id -n --name"
 CCSR_DROP_BARE="-c --continue --fork-session --tmux -p --print --bg --background"
 
-# Flags to keep, listed by arity so their values are not mistaken for the
-# positional prompt. Tables are transcribed from `claude --help`; an unlisted
-# flag is kept as a boolean, which is the harmless direction to be wrong in.
-CCSR_KEEP_VAL="--model --fallback-model --effort --permission-mode --permission-prompts --agent --agents --settings --setting-sources --system-prompt --append-system-prompt --system-prompt-snapshot --json-schema --input-format --output-format --max-budget-usd --debug-file --plugin-dir --plugin-url --environment --autocompact --remote-control-session-name-prefix"
+# Variadic flags, which swallow every bare token behind them. This is the only
+# keep-list left: everything else is classified by position (see filter_args),
+# so a flag added by a future Claude Code release needs no entry here.
 CCSR_KEEP_MANY="--add-dir --allowedTools --allowed-tools --disallowedTools --disallowed-tools --betas --file --mcp-config --tools"
-CCSR_KEEP_OPTVAL="-d --debug --prompt-suggestions --remote-control"
 
 CCSR_KEPT=""
 CCSR_DROPPED=""
@@ -173,10 +171,18 @@ keep_tok() { CCSR_KEPT="$CCSR_KEPT $(q "$1")"; }
 drop_tok() { CCSR_DROPPED="$CCSR_DROPPED $1"; }
 
 # filter_args <argv...> -> sets CCSR_KEPT (shell-quoted) and CCSR_DROPPED (plain)
+#
+# A bare token is classified by what sits in front of it rather than by a table
+# of flag names: it is the value of the preceding flag when that flag was a
+# `-`-token without `=`, and the positional prompt otherwise. A flag's value
+# always stands immediately behind its flag, so this holds for flags this script
+# has never heard of — `--future-flag value` carries the value across instead of
+# stranding `--future-flag` with nothing after it. The `=` test is what keeps
+# `claude --model=sonnet "fix the tests"` from re-sending the prompt.
 filter_args() {
   CCSR_KEPT=""
   CCSR_DROPPED=""
-  local t base next
+  local t base next flag=0
   while [ "$#" -gt 0 ]; do
     t="$1"; shift
     # --flag=value arrives as one token and carries its own value
@@ -186,37 +192,38 @@ filter_args() {
     esac
     next="${1:-}"
 
+    # a dropped flag takes its value with it, so nothing is left dangling behind
+    # it: every drop branch clears `flag`.
     if in_list "$base" "$CCSR_DROP_OPTVAL"; then
-      drop_tok "$t"
+      drop_tok "$t"; flag=0
       if [ "$t" = "$base" ]; then
         case "$next" in ""|-*) ;; *) drop_tok "$next"; shift ;; esac
       fi
     elif in_list "$base" "$CCSR_DROP_VAL"; then
-      drop_tok "$t"
+      drop_tok "$t"; flag=0
       if [ "$t" = "$base" ] && [ "$#" -gt 0 ]; then drop_tok "$next"; shift; fi
     elif in_list "$base" "$CCSR_DROP_BARE"; then
-      drop_tok "$t"
-    elif in_list "$base" "$CCSR_KEEP_VAL"; then
-      keep_tok "$t"
-      if [ "$t" = "$base" ] && [ "$#" -gt 0 ]; then keep_tok "$next"; shift; fi
+      drop_tok "$t"; flag=0
     elif in_list "$base" "$CCSR_KEEP_MANY"; then
-      keep_tok "$t"
+      keep_tok "$t"; flag=0
       if [ "$t" = "$base" ]; then
         while [ "$#" -gt 0 ]; do
           case "$1" in -*) break ;; *) keep_tok "$1"; shift ;; esac
         done
       fi
-    elif in_list "$base" "$CCSR_KEEP_OPTVAL"; then
-      keep_tok "$t"
-      if [ "$t" = "$base" ]; then
-        case "$next" in ""|-*) ;; *) keep_tok "$next"; shift ;; esac
-      fi
     else
       case "$t" in
-        -*) keep_tok "$t" ;;
-        # a bare token nobody claimed is the positional prompt; resuming with it
-        # would re-submit that prompt to the conversation
-        *)  drop_tok "$t" ;;
+        -*) keep_tok "$t"
+            # `--flag=value` carries its own value; a bare `--flag` may claim
+            # the token behind it
+            if [ "$t" = "$base" ]; then flag=1; else flag=0; fi
+            ;;
+        # a bare token behind a bare flag is that flag's value; otherwise it is
+        # the positional prompt, and resuming with it would re-submit that
+        # prompt to the conversation
+        *)  if [ "$flag" = 1 ]; then keep_tok "$t"; else drop_tok "$t"; fi
+            flag=0
+            ;;
       esac
     fi
   done
