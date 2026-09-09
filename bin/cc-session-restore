@@ -3,11 +3,14 @@
 #
 # A reboot kills the `claude` processes but not the conversations (Claude journals each
 # session to <config>/projects/...). This tool records which sessions are open and reopens
-# them afterwards with `claude --resume <id>`.
+# them afterwards with `claude --resume <id>`, carrying over the flags each session was
+# started with (--dangerously-skip-permissions, --model, --add-dir, ...).
 #
 # Source of truth: <config>/sessions/<PID>.json, which Claude Code maintains for every
 # running session ({"pid","sessionId","cwd","name","status",...}). This is exact for bare
 # `claude`, `--resume <uuid>`, and `--resume <name>`/picker-resumed sessions alike.
+# The one thing that file does not record is argv, so the snapshot reads that straight
+# off the live process (see cmd_snapshot).
 #
 # https://github.com/asadtariq96/cc-session-restore
 set -uo pipefail
@@ -21,6 +24,8 @@ export PATH=/usr/bin:/bin:/usr/sbin:/sbin
 
 # --- paths -------------------------------------------------------------------
 : "${CLAUDE_CONFIG_DIR:=$HOME/.claude}"
+# how long a session that is no longer running stays in the snapshot
+: "${CCSR_GONE_DAYS:=7}"
 SESSIONS_DIR="$CLAUDE_CONFIG_DIR/sessions"
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/cc-session-restore"
 SNAPSHOT="$STATE_DIR/snapshot.tsv"
@@ -38,85 +43,472 @@ self_path() {
   ( cd "$(dirname "$s")" >/dev/null 2>&1 && printf '%s/%s\n' "$(pwd -P)" "$(basename "$s")" )
 }
 
-# --- tiny JSON readers (no jq dependency) ------------------------------------
-json_str() { grep -o "\"$2\":\"[^\"]*\"" "$1" 2>/dev/null | head -1 | sed 's/.*:"//; s/"$//'; }
-json_num() { grep -o "\"$2\":[0-9]*"     "$1" 2>/dev/null | head -1 | sed 's/.*://'; }
+# --- JSON readers (no jq dependency) -----------------------------------------
+# plutil ships with every macOS and parses JSON properly. A hand-rolled
+# "key":"([^"]*)" grep gets a cwd like /tmp/dir "x" y wrong: the value is stored
+# escaped, so the match stops at the first \" and the path comes back truncated.
+# Values are read via $(...) first (which drops the trailing newline plutil adds)
+# and only then flattened, so a tab or newline inside a name cannot break the TSV.
+json_get() {
+  local v
+  v="$(plutil -extract "$2" raw -o - "$1" 2>/dev/null)" || return 1
+  printf '%s' "$v" | tr '\t\n' '  '
+}
+
+# --- live session ids --------------------------------------------------------
+# Space-padded list of sessionIds that still have a live `claude` process, so
+# membership is a plain glob match (bash 3.2 under launchd has no assoc arrays).
+live_sids() {
+  local f pid sid comm out=" "
+  for f in "$SESSIONS_DIR"/*.json; do
+    [ -e "$f" ] || continue
+    pid="$(json_get "$f" pid)"
+    sid="$(json_get "$f" sessionId)"
+    if [ -z "$pid" ] || [ -z "$sid" ]; then continue; fi
+    comm="$(ps -o comm= -p "$pid" 2>/dev/null)" || continue
+    case "$comm" in *claude) ;; *) continue ;; esac
+    case "$out" in *" $sid "*) continue ;; esac
+    out="$out$sid "
+  done
+  printf '%s' "$out"
+}
 
 # --- snapshot ----------------------------------------------------------------
+# Snapshot format: one `#` header line, then TSV rows of 8 columns:
+#   sessionId <TAB> cwd <TAB> title <TAB> nameSource <TAB> status <TAB> seenAt <TAB> boot <TAB> argv
+# argv comes last so `read` can take the rest of the line in one go. Rows written
+# by older versions have 3 or 5 columns and are padded on read (snapshot_rows).
+#
+# A session that no longer has a process keeps its row, marked `gone`. Dropping
+# it was cheap to write and expensive to live with: a tab closed by mistake
+# stopped existing 60 seconds later with nothing left to reopen it from, and a
+# session started after a reboot but before `restore` overwrote the whole set.
+# `seenAt` is the last snapshot that still saw the session running and `boot` is
+# the kernel boot time at that moment — which is how restore tells a session that
+# went down with the machine from one that was closed by hand.
+#
+# No column is ever left empty: an unrecorded value is written as `-`. Tab is an
+# IFS whitespace character, so `IFS=$'\t' read` collapses two adjacent tabs into
+# one delimiter and every field after the gap shifts left — an empty column would
+# quietly hand argv to the boot variable.
+SNAPSHOT_HEADER="# cc-session-restore snapshot v2 | sessionId, cwd, title, nameSource, status, seenAt, boot, argv (- = not recorded)"
+
+# `{ sec = 1784826415, usec = 789554 } Thu Jul 23 20:06:55 2026`. The character
+# class in front of `sec` is what keeps the greedy `.*` off the `usec` field —
+# without it this reads back microseconds. An unreadable boot time yields nothing,
+# and a row with no boot recorded is treated as lost rather than closed, which is
+# the safe direction to be wrong in.
+boot_epoch() { sysctl -n kern.boottime 2>/dev/null | sed -n 's/.*[{ ]sec *= *\([0-9][0-9]*\).*/\1/p'; }
+
+ts_human() {
+  case "$1" in
+    ''|*[!0-9]*) printf '?' ;;
+    *) date -r "$1" '+%Y-%m-%d %H:%M' 2>/dev/null || printf '?' ;;
+  esac
+}
+
+# Snapshot rows without the header, every row padded to 8 columns. A file written
+# by an older version reads back as live rows with no boot recorded, which is
+# what makes them restorable exactly as they were before.
+snapshot_rows() {
+  [ -s "$SNAPSHOT" ] || return 0
+  awk -F'\t' -v OFS='\t' -v now="$(date +%s)" '
+    /^#/ || NF == 0 { next }
+    NF <= 5 { $8 = $5; $5 = "live"; $6 = now; $7 = "" }
+    { for (i = 1; i <= 8; i++) if ($i == "") $i = "-"; NF = 8; print }
+  ' "$SNAPSHOT"
+}
+
 cmd_snapshot() {
   require_macos
   [ -d "$SESSIONS_DIR" ] || die "Claude session dir not found: $SESSIONS_DIR
 (Is Claude Code installed and recent enough? Set CLAUDE_CONFIG_DIR if you relocated ~/.claude.)"
   mkdir -p "$STATE_DIR"
   local tmp; tmp="$(mktemp "$STATE_DIR/.snap.XXXXXX")"
-  local claimed=" " f pid sid cwd name comm title
+  local claimed=" " f pid sid cwd start_cwd name nsrc entry comm title args
+  local transcripts
+  local now boot; now="$(date +%s)"; boot="$(boot_epoch)"
+  local n_live=0 n_gone=0 n_expired=0
+
+  printf '%s\n' "$SNAPSHOT_HEADER" > "$tmp"
 
   for f in "$SESSIONS_DIR"/*.json; do
     [ -e "$f" ] || continue
-    pid="$(json_num "$f" pid)"
-    sid="$(json_str "$f" sessionId)"
-    cwd="$(json_str "$f" cwd)"
-    name="$(json_str "$f" name)"
+    pid="$(json_get "$f" pid)"
+    sid="$(json_get "$f" sessionId)"
+    cwd="$(json_get "$f" cwd)"
+    name="$(json_get "$f" name)"
+    nsrc="$(json_get "$f" nameSource)"
+    entry="$(json_get "$f" entrypoint)"
     if [ -z "$pid" ] || [ -z "$sid" ]; then continue; fi
+    # only sessions a person is sitting in front of get a tab back. Hooks and SDK
+    # callers run `claude --print ...` and register as entrypoint "sdk-cli"; they
+    # are short-lived and reopening them as interactive tabs is nonsense. An
+    # absent entrypoint means an older Claude Code, so don't filter on it.
+    case "$entry" in ""|cli) ;; *) continue ;; esac
     # keep only PIDs that are still a live `claude` process (reject recycled PIDs)
     comm="$(ps -o comm= -p "$pid" 2>/dev/null)" || continue
     case "$comm" in *claude) ;; *) continue ;; esac
     case "$claimed" in *" $sid "*) continue ;; esac
+    # A session Claude Code has not journalled yet cannot be resumed — the new
+    # tab would come up on "No conversation found with session ID". It joins the
+    # snapshot on a later tick, once the conversation has something in it.
+    transcripts=("$CLAUDE_CONFIG_DIR"/projects/*/"$sid".jsonl)
+    [ -f "${transcripts[0]}" ] || continue
     claimed="$claimed$sid "
+    # Every cwd Claude Code publishes — the session JSON, the transcript's latest
+    # record, the process itself — follows the session as it moves, so a tab
+    # opened in ~ that spent the session in a subdirectory would reopen there.
+    # The directory the tab belongs in is the one it started in, and the only
+    # place that survives is the first record of the transcript. Read through
+    # plutil for the same reason json_get does: the value arrives JSON-escaped.
+    start_cwd="$(grep -m1 '"cwd":' "${transcripts[0]}" 2>/dev/null | plutil -extract cwd raw -o - - 2>/dev/null)"
+    [ -n "$start_cwd" ] && cwd="$(printf '%s' "$start_cwd" | tr '\t\n' '  ')"
     title="${name:-$(basename "$cwd")}"
-    printf '%s\t%s\t%s\n' "$sid" "$cwd" "$title" >> "$tmp"
+    # How the session was launched exists nowhere on disk — not in the session
+    # JSON, not in the transcript (its permissionMode is the *current* mode), not
+    # in ~/.claude.json. It only exists in the process, so read it while the PID
+    # is alive.
+    #
+    # The LC_ALL override is load-bearing: under LC_ALL=C (set at the top of this
+    # script) ps vis-escapes every non-ASCII byte, turning an argument like
+    # /Users/me/Документы into M-PM^TM-PM->M-PM-:... A UTF-8 LC_CTYPE keeps the
+    # bytes intact.
+    #
+    # Caveat: ps joins argv with spaces and quotes nothing, so an argument that
+    # itself contains a space comes back as two tokens and will split on restore
+    # (it escapes tab and newline as \011 and \012, but not the backslash that
+    # introduces them). The exact NUL-separated argv needs sysctl KERN_PROCARGS2,
+    # which is out of reach from bash; the likeliest such argument — the session
+    # name — is carried in the nameSource/title columns instead.
+    args="$(env LC_ALL= LC_CTYPE=UTF-8 ps -ww -o args= -p "$pid" 2>/dev/null | tr '\t\n' '  ')"
+    [ -n "$nsrc" ] || nsrc="-"
+    [ -n "$boot" ] || boot="-"
+    [ -n "$args" ] || args="-"
+    printf '%s\t%s\t%s\t%s\tlive\t%s\t%s\t%s\n' "$sid" "$cwd" "$title" "$nsrc" "$now" "$boot" "$args" >> "$tmp"
+    n_live=$((n_live + 1))
   done
 
-  local n; n="$(grep -c . "$tmp" 2>/dev/null || true)"; n="${n:-0}"
-  # don't clobber a good snapshot with an empty one (e.g. run mid-shutdown)
-  if [ "$n" -eq 0 ] && [ -s "$SNAPSHOT" ]; then
-    rm -f "$tmp"; echo "snapshot: 0 live sessions; kept existing $SNAPSHOT"; return 0
-  fi
+  # Everything the previous snapshot knew about and that has no process now is
+  # carried across, marked `gone`, with the timestamps of its last sighting left
+  # untouched — that sighting is the answer to "when did this disappear", and
+  # re-stamping it each tick would push the row out of the keep-window never.
+  # This also replaces the old "don't clobber a good snapshot with an empty one"
+  # guard: an empty run no longer erases anything, it just tombstones.
+  local ttl=$((CCSR_GONE_DAYS * 86400))
+  local osid ocwd otitle onsrc ostatus oseen oboot oargs
+  while IFS=$'\t' read -r osid ocwd otitle onsrc ostatus oseen oboot oargs; do
+    [ -n "$osid" ] || continue
+    case "$claimed" in *" $osid "*) continue ;; esac
+    case "$oseen" in ''|*[!0-9]*) oseen="$now" ;; esac
+    if [ "$ostatus" = gone ] && [ "$((now - oseen))" -gt "$ttl" ]; then
+      n_expired=$((n_expired + 1)); continue
+    fi
+    printf '%s\t%s\t%s\t%s\tgone\t%s\t%s\t%s\n' "$osid" "$ocwd" "$otitle" "$onsrc" "$oseen" "$oboot" "$oargs" >> "$tmp"
+    n_gone=$((n_gone + 1))
+  done < <(snapshot_rows)
+
   mv "$tmp" "$SNAPSHOT"
-  echo "snapshot: captured $n live session(s) -> $SNAPSHOT"
+  printf 'snapshot: %s live, %s gone, %s expired past %s day(s) -> %s\n' \
+    "$n_live" "$n_gone" "$n_expired" "$CCSR_GONE_DAYS" "$SNAPSHOT"
+}
+
+# --- argv filtering ----------------------------------------------------------
+# Flags to drop: they pick an existing conversation, run non-interactively, or
+# create a new worktree — all of which fight with the `--resume <id>` we append.
+# -n/--name is dropped here and re-added from the session JSON, where the name is
+# a single field rather than space-split argv.
+CCSR_DROP_OPTVAL="-r --resume --from-pr --cloud --teleport -w --worktree"
+CCSR_DROP_VAL="--session-id -n --name"
+CCSR_DROP_BARE="-c --continue --fork-session --tmux -p --print --bg --background"
+
+# Variadic flags, which swallow every bare token behind them. This is the only
+# keep-list left: everything else is classified by position (see filter_args),
+# so a flag added by a future Claude Code release needs no entry here.
+CCSR_KEEP_MANY="--add-dir --allowedTools --allowed-tools --disallowedTools --disallowed-tools --betas --file --mcp-config --tools"
+
+CCSR_KEPT=""
+CCSR_DROPPED=""
+
+in_list() { case " $2 " in *" $1 "*) return 0 ;; esac; return 1; }
+
+# Shell-quote, but only when the token actually needs it: the characters below
+# are inert in both bash and zsh, and leaving them alone keeps --dry-run output
+# readable (--disallowed-tools=A,B rather than --disallowed-tools=A\,B).
+q() {
+  case "$1" in
+    ""|*[!A-Za-z0-9_.,:/=@+-]*) printf '%q' "$1" ;;
+    *)                          printf '%s' "$1" ;;
+  esac
+}
+keep_tok() { CCSR_KEPT="$CCSR_KEPT $(q "$1")"; }
+drop_tok() { CCSR_DROPPED="$CCSR_DROPPED $1"; }
+
+# filter_args <argv...> -> sets CCSR_KEPT (shell-quoted) and CCSR_DROPPED (plain)
+#
+# A bare token is classified by what sits in front of it rather than by a table
+# of flag names: it is the value of the preceding flag when that flag was a
+# `-`-token without `=`, and the positional prompt otherwise. A flag's value
+# always stands immediately behind its flag, so this holds for flags this script
+# has never heard of — `--future-flag value` carries the value across instead of
+# stranding `--future-flag` with nothing after it. The `=` test is what keeps
+# `claude --model=sonnet "fix the tests"` from re-sending the prompt.
+filter_args() {
+  CCSR_KEPT=""
+  CCSR_DROPPED=""
+  local t base next flag=0
+  local drop_bare="$CCSR_DROP_BARE" drop_val="$CCSR_DROP_VAL"
+  # once the session's real permission mode is known, whatever argv asked for is
+  # stale — drop it here, re-add the mode that was read in build_cmd
+  if [ "$CCSR_DROP_PERM" = 1 ]; then
+    drop_bare="$drop_bare $CCSR_PERM_DROP_BARE"
+    drop_val="$drop_val $CCSR_PERM_DROP_VAL"
+  fi
+  while [ "$#" -gt 0 ]; do
+    t="$1"; shift
+    # --flag=value arrives as one token and carries its own value
+    case "$t" in
+      --*=*) base="${t%%=*}" ;;
+      *)     base="$t" ;;
+    esac
+    next="${1:-}"
+
+    # a dropped flag takes its value with it, so nothing is left dangling behind
+    # it: every drop branch clears `flag`.
+    if in_list "$base" "$CCSR_DROP_OPTVAL"; then
+      drop_tok "$t"; flag=0
+      if [ "$t" = "$base" ]; then
+        case "$next" in ""|-*) ;; *) drop_tok "$next"; shift ;; esac
+      fi
+    elif in_list "$base" "$drop_val"; then
+      drop_tok "$t"; flag=0
+      if [ "$t" = "$base" ] && [ "$#" -gt 0 ]; then drop_tok "$next"; shift; fi
+    elif in_list "$base" "$drop_bare"; then
+      drop_tok "$t"; flag=0
+    elif in_list "$base" "$CCSR_KEEP_MANY"; then
+      keep_tok "$t"; flag=0
+      if [ "$t" = "$base" ]; then
+        while [ "$#" -gt 0 ]; do
+          case "$1" in -*) break ;; *) keep_tok "$1"; shift ;; esac
+        done
+      fi
+    else
+      case "$t" in
+        -*) keep_tok "$t"
+            # `--flag=value` carries its own value; a bare `--flag` may claim
+            # the token behind it
+            if [ "$t" = "$base" ]; then flag=1; else flag=0; fi
+            ;;
+        # a bare token behind a bare flag is that flag's value; otherwise it is
+        # the positional prompt, and resuming with it would re-submit that
+        # prompt to the conversation
+        *)  if [ "$flag" = 1 ]; then keep_tok "$t"; else drop_tok "$t"; fi
+            flag=0
+            ;;
+      esac
+    fi
+  done
+}
+
+# --- permission mode ---------------------------------------------------------
+# The mode a session ends in is rarely the mode it was launched with — shift-tab
+# and /permissions change it and argv never learns. Claude Code journals every
+# switch to the transcript as a record of its own, so the last one is the mode
+# the session was actually sitting in when it died.
+#
+# `default` is missing from the "Allowed choices" the CLI prints for a bad
+# --permission-mode, but the transcript writes it and `claude --permission-mode
+# default` is accepted (measured on 2.1.266), so it belongs here.
+CCSR_MODES="default acceptEdits auto bypassPermissions manual dontAsk plan"
+
+# `--dangerously-skip-permissions` overrides `--permission-mode` outright —
+# measured: `--dangerously-skip-permissions --permission-mode manual` still runs
+# Bash unprompted — so it cannot come back alongside a restored mode. Its
+# `--allow-` sibling only keeps bypass reachable in the shift-tab cycle without
+# switching to it, which is what a restored non-bypass mode needs.
+CCSR_PERM_DROP_BARE="--dangerously-skip-permissions --allow-dangerously-skip-permissions"
+CCSR_PERM_DROP_VAL="--permission-mode"
+
+CCSR_DROP_PERM=0          # set per session by build_cmd, read by filter_args
+CCSR_LAUNCH_FLAGS_ONLY=0  # `restore --launch-flags-only` goes back to reading argv alone
+CCSR_MODE=""
+
+# last_permission_mode <sessionId> -> prints the mode the session ended in, or nothing
+last_permission_mode() {
+  local sid="$1" f m transcripts
+  transcripts=("$CLAUDE_CONFIG_DIR"/projects/*/"$sid".jsonl)
+  for f in "${transcripts[@]}"; do
+    [ -f "$f" ] || continue
+    # `tail -r` (BSD, in /usr/bin, so inside this script's trimmed PATH) reverses
+    # the file, which turns "last record" into "first match" — ~5ms on a 1MB
+    # transcript instead of a full scan. Its exit status is no use: grep -m1
+    # closes the pipe and tail dies on SIGPIPE, so the match is judged by content.
+    m="$(tail -r "$f" 2>/dev/null | grep -m1 -o '"type":"permission-mode","permissionMode":"[a-zA-Z]*"')"
+    [ -n "$m" ] || continue
+    m="${m##*:\"}"; m="${m%\"}"
+    # a mode from a newer Claude Code than this script knows about: leave the
+    # command alone rather than build one the CLI will refuse to start
+    in_list "$m" "$CCSR_MODES" || continue
+    printf '%s' "$m"
+    return 0
+  done
+  return 1
+}
+
+# build_cmd <sid> <cwd> <title> <nameSource> <argv> -> sets CCSR_CMD, CCSR_DROPPED, CCSR_MODE
+build_cmd() {
+  local sid="$1" cwd="$2" title="$3" nsrc="$4" args="$5"
+  local launcher argv0 name_opt="" perm_opt="" allow=0
+  CCSR_KEPT=""
+  CCSR_DROPPED=""
+  CCSR_MODE=""
+  CCSR_DROP_PERM=0
+
+  if [ "$CCSR_LAUNCH_FLAGS_ONLY" = 0 ]; then
+    CCSR_MODE="$(last_permission_mode "$sid")"
+    [ -n "$CCSR_MODE" ] && CCSR_DROP_PERM=1
+  fi
+
+  if [ -n "$args" ]; then
+    # ps already joined argv with spaces; re-split it the same way the shell will
+    # shellcheck disable=SC2086
+    set -- $args
+    argv0="$1"; shift
+    # `command` matters: a shell alias for `claude` would re-apply flags that are
+    # already captured in argv (e.g. alias claude='claude --disallowed-tools=...')
+    case "$argv0" in
+      */*) launcher="$(q "$argv0")" ;;
+      *)   launcher="command claude" ;;
+    esac
+    filter_args "$@"
+  else
+    # pre-5-column snapshot row: no argv, so behave exactly like older versions
+    # and let the user's own alias/function for `claude` apply
+    launcher="claude"
+  fi
+
+  # a derived name was generated by Claude Code, not asked for — don't pin it
+  case "$nsrc" in
+    ""|derived) ;;
+    *) [ -n "$title" ] && name_opt=" -n $(q "$title")" ;;
+  esac
+
+  if [ -n "$CCSR_MODE" ]; then
+    # bypass belongs in the restored tab's shift-tab cycle if the command line
+    # allowed it — or if the session ended in it, which proves it was allowed.
+    case " $args " in
+      *" --dangerously-skip-permissions "*|*" --allow-dangerously-skip-permissions "*) allow=1 ;;
+    esac
+    [ "$CCSR_MODE" = bypassPermissions ] && allow=1
+    [ "$allow" = 1 ] && perm_opt=" --allow-dangerously-skip-permissions"
+    perm_opt="$perm_opt --permission-mode $CCSR_MODE"
+  fi
+
+  CCSR_CMD="cd $(q "$cwd") && ${launcher}${CCSR_KEPT}${name_opt}${perm_opt} --resume ${sid}"
 }
 
 # --- restore -----------------------------------------------------------------
 cmd_restore() {
   require_macos
-  local dry=0
-  [ "${1:-}" = "--dry-run" ] && dry=1
+  local dry=0 force=0 want_closed=0 a
+  for a in "$@"; do
+    case "$a" in
+      --dry-run) dry=1 ;;
+      --force)   force=1 ;;
+      --include-closed) want_closed=1 ;;
+      --launch-flags-only) CCSR_LAUNCH_FLAGS_ONLY=1 ;;
+      *) die "usage: cc-session-restore restore [--dry-run] [--force] [--include-closed] [--launch-flags-only]" ;;
+    esac
+  done
   [ -s "$SNAPSHOT" ] || die "no snapshot at $SNAPSHOT (run: cc-session-restore snapshot)"
 
+  # sessions that are already open don't need a second tab pointing at them
+  local live=" "
+  [ "$force" = 1 ] || live="$(live_sids)"
+  local boot; boot="$(boot_epoch)"
+
+  local osa first=1 sid cwd title nsrc status seen sboot args esc mode
+  local launched=0 skipped=0 closed=0
+  osa='tell application "iTerm2"
+  activate
+  set w to (create window with default profile)
+'
+  [ "$dry" = 1 ] && echo "restore (dry-run): $(snapshot_rows | grep -c .) session(s)"
+
+  while IFS=$'\t' read -r sid cwd title nsrc status seen sboot args; do
+    [ -n "$sid" ] || continue
+    [ "$title" = - ] && title=""
+    [ "$nsrc"  = - ] && nsrc=""
+    [ "$sboot" = - ] && sboot=""
+    [ "$args"  = - ] && args=""
+    case "$live" in
+      *" $sid "*)
+        skipped=$((skipped + 1))
+        if [ "$dry" = 1 ]; then
+          printf '  %s  (%s)\n     skip — already running\n' "$title" "$sid"
+          mode=""
+          [ "$CCSR_LAUNCH_FLAGS_ONLY" = 1 ] || mode="$(last_permission_mode "$sid")"
+          [ -n "$mode" ] && printf '     permission mode: %s\n' "$mode"
+        fi
+        continue
+        ;;
+    esac
+
+    # A session that disappeared while the boot now running was already up was
+    # closed rather than lost — bringing it back on every restore would make
+    # closing a tab impossible. One whose last sighting belongs to an earlier
+    # boot went down with the machine, which is the case this tool exists for.
+    # A row from an older snapshot format has no boot recorded and so is always
+    # treated as lost, exactly as it was before the column existed.
+    if [ "$status" = gone ] && [ "$want_closed" = 0 ] && [ -n "$sboot" ] && [ "$sboot" = "$boot" ]; then
+      closed=$((closed + 1))
+      [ "$dry" = 1 ] && printf '  %s  (%s)\n     skip — closed %s, this boot (--include-closed to reopen)\n' \
+        "$title" "$sid" "$(ts_human "$seen")"
+      continue
+    fi
+
+    build_cmd "$sid" "$cwd" "$title" "$nsrc" "$args"
+    launched=$((launched + 1))
+
+    if [ "$dry" = 1 ]; then
+      printf '  %s  (%s)\n     %s\n' "$title" "$sid" "$CCSR_CMD"
+      [ "$status" = gone ] && printf '     gone — last seen %s\n' "$(ts_human "$seen")"
+      [ -n "$CCSR_MODE" ] && printf '     permission mode: %s (restored from transcript)\n' "$CCSR_MODE"
+      [ -n "$CCSR_DROPPED" ] && printf '     dropped:%s\n' "$CCSR_DROPPED"
+      continue
+    fi
+
+    # AppleScript string literals only special-case backslash and double quote
+    esc="$(printf '%s' "$CCSR_CMD" | sed 's/\\/\\\\/g; s/"/\\"/g')"
+    if [ "$first" = 1 ]; then
+      osa+="  tell current session of w to write text \"$esc\"
+"
+      first=0
+    else
+      osa+="  tell w to create tab with default profile
+  tell current session of w to write text \"$esc\"
+"
+    fi
+  done < <(snapshot_rows)
+  osa+='end tell'
+
   if [ "$dry" = 1 ]; then
-    echo "restore (dry-run): $(grep -c . "$SNAPSHOT") session(s)"
-    local sid cwd title
-    while IFS=$'\t' read -r sid cwd title; do
-      [ -n "$sid" ] || continue
-      printf '  %s  (%s)\n     cd %s && claude --resume %s\n' "$title" "$sid" "$cwd" "$sid"
-    done < "$SNAPSHOT"
+    printf 'restore (dry-run): would launch %s tab(s), skip %s already running, %s closed this boot\n' \
+      "$launched" "$skipped" "$closed"
+    return 0
+  fi
+
+  if [ "$launched" -eq 0 ]; then
+    printf 'restore: nothing to reopen — %s session(s) already running, %s closed during this boot.\n' \
+      "$skipped" "$closed"
     return 0
   fi
 
   osascript -e 'id of app "iTerm"' >/dev/null 2>&1 \
     || die "iTerm2 not found — this version restores into iTerm2 only."
-
-  local osa first=1 sid cwd title cmd
-  osa='tell application "iTerm2"
-  activate
-  set w to (create window with default profile)
-'
-  while IFS=$'\t' read -r sid cwd title; do
-    [ -n "$sid" ] || continue
-    cmd="cd \\\"$cwd\\\" && claude --resume $sid"
-    if [ "$first" = 1 ]; then
-      osa+="  tell current session of w to write text \"$cmd\"
-"
-      first=0
-    else
-      osa+="  tell w to create tab with default profile
-  tell current session of w to write text \"$cmd\"
-"
-    fi
-  done < "$SNAPSHOT"
-  osa+='end tell'
   printf '%s\n' "$osa" | osascript -
-  echo "restore: launched $(grep -c . "$SNAPSHOT") tab(s)."
+  printf 'restore: launched %s tab(s), skipped %s already running, %s closed this boot.\n' \
+    "$launched" "$skipped" "$closed"
 }
 
 # --- launch agent ------------------------------------------------------------
@@ -170,7 +562,15 @@ cmd_status() {
   printf 'claude sessions: %s %s\n' "$SESSIONS_DIR" "$found"
   echo "state dir:       $STATE_DIR"
   if [ -s "$SNAPSHOT" ]; then
-    printf 'last snapshot:   %s — %s session(s)\n' "$(stat -f '%Sm' -t '%Y-%m-%d %H:%M' "$SNAPSHOT")" "$(grep -c . "$SNAPSHOT")"
+    local rows n_live n_gone withargs
+    rows="$(snapshot_rows | grep -c . )"
+    n_live="$(snapshot_rows | awk -F'\t' '$5 == "live" { n++ } END { print n+0 }')"
+    n_gone="$(snapshot_rows | awk -F'\t' '$5 == "gone" { n++ } END { print n+0 }')"
+    withargs="$(snapshot_rows | awk -F'\t' '$8 != "" { n++ } END { print n+0 }')"
+    printf 'last snapshot:   %s — %s row(s): %s live, %s gone\n' \
+      "$(stat -f '%Sm' -t '%Y-%m-%d %H:%M' "$SNAPSHOT")" "$rows" "$n_live" "$n_gone"
+    printf 'argv captured:   %s of %s row(s)\n' "$withargs" "$rows"
+    printf 'gone rows kept:  %s day(s)\n' "$CCSR_GONE_DAYS"
   else
     echo "last snapshot:   (none)"
   fi
@@ -199,7 +599,13 @@ USAGE:
 
 COMMANDS:
   snapshot              Record currently-open Claude sessions to the snapshot file
-  restore [--dry-run]   Reopen one iTerm2 window with a tab per snapshotted session
+  restore [options]     Reopen one iTerm2 window with a tab per snapshotted session
+      --dry-run         Print the commands that would run, and what was filtered out
+      --force           Also reopen sessions that are still running (default: skip them)
+      --include-closed  Also reopen sessions that were closed during this boot
+      --launch-flags-only
+                        Restore the permission mode from the launch flags only,
+                        ignoring the mode the session was switched to
   status                Show config / snapshot / agent status
   agent install         Install + load the 60s auto-snapshot LaunchAgent
   agent uninstall       Unload + remove the LaunchAgent
